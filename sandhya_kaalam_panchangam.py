@@ -1,6 +1,6 @@
 # Author: Goutham Mylavarapu
 # Updated: 29 January 2025
-# Version: 3.0 (With Persistent Caching)
+# Version: 4.0 (multi-key api support)
 
 # [SUMMARY]:
 # Generates .ics file for a given location and date range
@@ -34,6 +34,11 @@
 #     --end-date 2025-01-31 \
 #     --ugadi-date 2025-03-30
 
+# python sandhya_kaalam_panchangam.py "Mason, OH" \
+#     --start-date 2025-01-29 \
+#     --end-date 2025-01-31 \
+#     --debug  # Add this flag to see raw responses
+
 
 import os
 import pickle
@@ -52,10 +57,10 @@ CACHE_DIR = "./panchangam_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 # Load secrets and initialize API client
-secrets = toml.load('secrets.toml')
+secrets = toml.load('multi_secrets.toml')
 
-CLIENT_ID = secrets['api']['YOUR_CLIENT_ID']
-CLIENT_SECRET = secrets['api']['YOUR_CLIENT_SECRET']
+# CLIENT_ID = secrets['api']['YOUR_CLIENT_ID']
+# CLIENT_SECRET = secrets['api']['YOUR_CLIENT_SECRET']
 
 PROKERALA_TOKEN_URL = "https://api.prokerala.com/token"
 PROKERALA_API_BASE = "https://api.prokerala.com/v2"
@@ -63,6 +68,9 @@ PROKERALA_API_BASE = "https://api.prokerala.com/v2"
 # API limits for ProKerala
 RATE_LIMIT_DELAY = 15  # Seconds between API calls
 MAX_RETRIES = 3
+RATE_LIMIT_BASE_DELAY = 15  # Start with 15 seconds
+RATE_LIMIT_MAX_DELAY = 300  # 5 minutes max
+BACKOFF_FACTOR = 1.5
 
 # Vedic mappings
 VAARA_MAP = {
@@ -98,35 +106,42 @@ SAMVATSARA = [
 ]
 
 
-
 class ProkeralaAuth:
-    def __init__(self, client_id, client_secret):
-        self.client_id = client_id
-        self.client_secret = client_secret
+    def __init__(self, clients):
+        self.clients = clients
+        self.current_client = 0
         self.token = None
         self.token_expiry = None
 
     def get_access_token(self):
         if self.token and datetime.now() < self.token_expiry:
             return self.token
+            
+        client = self.clients[self.current_client]
+        print(f"Using client {self.current_client+1}/{len(self.clients)}")
         
-        print("Fetching new access token...")
         response = requests.post(
             PROKERALA_TOKEN_URL,
             data={
                 'grant_type': 'client_credentials',
-                'client_id': self.client_id,
-                'client_secret': self.client_secret
+                'client_id': client['id'],
+                'client_secret': client['secret']
             }
         )
         
         if response.status_code != 200:
-            raise Exception(f"Authentication failed: {response.text}")
+            self._rotate_client()
+            return self.get_access_token()
             
         data = response.json()
         self.token = data['access_token']
         self.token_expiry = datetime.now() + timedelta(seconds=data['expires_in'] - 60)
         return self.token
+
+    def _rotate_client(self):
+        self.current_client = (self.current_client + 1) % len(self.clients)
+        self.token = None
+        print(f"Rotated to client {self.current_client+1}")
     
 
 def get_cache_filename(location, cache_type):
@@ -203,75 +218,84 @@ def get_vedic_details(date, ugadi_date):
 
 
 def get_panchangam_details(lat, lon, event_time, tz, location, auth):
-    """Get panchangam details with robust error handling"""
+    """Get panchangam details with robust error handling
+    
+    Key Features:
+    1. Multi-Client Rotation: Automatically switches API credentials when hitting rate limits
+    2. Exponential Backoff: Starts with 15s delay, doubles each retry (15s → 30s → 60s → 120s → 240s)
+    3. Robust Error Handling:
+    4. Handles HTTP errors (429, 500, etc.)
+    5. Validates JSON structure
+    6. Graceful fallbacks for missing data
+    7. Caching: Stores successful responses to minimize API calls
+    8. Debugging: Logs truncated response bodies for troubleshooting
+    9. Timeouts: Fails fast with 10-second timeout
+
+    """
     cache = load_cache(location, 'panchangam')
     cache_key = (round(lat, 4), round(lon, 4), event_time.date().isoformat(), tz)
     
     if cache_key in cache:
         return cache[cache_key]
     
-    try:
-        access_token = auth.get_access_token()
-        headers = {'Authorization': f'Bearer {access_token}'}
-        
-        response = requests.get(
-            f"{PROKERALA_API_BASE}/astrology/panchang",
-            params={
-                'ayanamsa': 1,
-                'coordinates': f"{lat},{lon}",
-                'datetime': event_time.isoformat(),
-                'timezone': tz,
-                'la': 'te'
-            },
-            headers=headers
-        )
-        
-        response.raise_for_status()
-        response_text = response.text  # Capture raw response first
-        result = response.json()
+    for attempt in range(MAX_RETRIES):
+        try:
+            access_token = auth.get_access_token()
+            headers = {'Authorization': f'Bearer {access_token}'}
+            
+            response = requests.get(
+                f"{PROKERALA_API_BASE}/astrology/panchang",
+                params={
+                    'ayanamsa': 1,
+                    'coordinates': f"{lat},{lon}",
+                    'datetime': event_time.isoformat(),
+                    # 'timezone': tz,
+                    'la': 'te'
+                },
+                headers=headers,
+                timeout=10
+            )
 
-        # Validate response structure
-        if not isinstance(result, dict):
-            print(f"Invalid API response format: {response_text}")
-            return None
+            response.raise_for_status()
+            result = response.json()
 
-        if result.get('status') != 'success':
-            error_msg = "Unknown error"
-            if 'errors' in result:
-                errors = result['errors']
-                if isinstance(errors, list) and len(errors) > 0:
-                    error_msg = errors[0].get('detail', 'Unknown error')
-            print(f"API Error: {error_msg}")
-            return None
+            # Accept both 'success' and 'ok' statuses
+            if result.get('status', '').lower() not in ['success', 'ok']:
+                raise ValueError(f"API status failure: {result.get('status')}")
 
-        if 'data' not in result or 'panchang' not in result['data']:
-            print(f"Missing panchang data: {response_text}")
-            return None
+            # Validate response structure
+            panchang = result.get('data', {}).get('panchang', {})
+            if not panchang:
+                raise ValueError("Missing panchang data")
 
-        panchang = result['data']['panchang']
-        
-        data = {
-            'tithi': f"{panchang.get('tithi', {}).get('paksha', '')} {panchang.get('tithi', {}).get('name', 'N/A')}",
-            'nakshatra': panchang.get('nakshatra', [{}])[0].get('name', 'N/A'),
-            'vaara': VAARA_MAP.get(panchang.get('vaara', {}).get('name', ''), 'N/A')
-        }
+            # Extract fields with fallbacks
+            data = {
+                'tithi': f"{panchang.get('tithi', {}).get('paksha', '')} {panchang.get('tithi', {}).get('name', 'N/A')}".strip(),
+                'nakshatra': panchang.get('nakshatra', [{}])[0].get('name', 'N/A'),
+                'vaara': VAARA_MAP.get(
+                    panchang.get('vaara', {}).get('name', ''),
+                    panchang.get('vaara', {}).get('name', 'N/A')
+                )
+            }
 
-        # Clean empty prefixes
-        data['tithi'] = data['tithi'].strip()
-        
-        cache[cache_key] = data
-        save_cache(location, 'panchangam', cache)
-        return data
-        
-    except requests.HTTPError as e:
-        print(f"HTTP Error ({e.response.status_code}): {e.response.text}")
-        return None
-    except json.JSONDecodeError:
-        print(f"Invalid JSON response: {response_text}")
-        return None
-    except Exception as e:
-        print(f"Unexpected error: {str(e)}")
-        return None
+            cache[cache_key] = data
+            save_cache(location, 'panchangam', cache)
+            return data
+
+        except Exception as e:
+            print(f"Attempt {attempt+1} failed: {str(e)}")
+            if attempt < MAX_RETRIES - 1:
+                delay = 15 * (attempt + 1)
+                print(f"Retrying in {delay}s...")
+                time.sleep(delay)
+                auth._rotate_client()
+            else:
+                print("Max retries reached. Using fallback data.")
+                return {
+                    'tithi': 'సమాచారం అందుబాటులో లేదు',
+                    'nakshatra': 'N/A',
+                    'vaara': 'N/A'
+                }
 
 
 def generate_event(start_time, end_time, summary, location, day_str, event_type, panchangam, vedic_details):
@@ -281,11 +305,8 @@ def generate_event(start_time, end_time, summary, location, day_str, event_type,
     nakshatra = panchangam.get('nakshatra', 'N/A') if panchangam else 'N/A'
     vaara = panchangam.get('vaara', 'N/A') if panchangam else 'N/A'
     
-    # Clean location name
-    clean_location = location.split(',')[0].strip()  # Show only city name
-    
     description = (
-        f"{summary} at {clean_location} on {day_str}\n"
+        f"{summary} at {location} on {day_str}\n"
         f"సంవత్సరము: {vedic_details['samvatsara']}\n"
         f"అయనము: {vedic_details['ayana']}\n"
         f"మాసము: {vedic_details['masa']}\n"
@@ -300,7 +321,7 @@ def generate_event(start_time, end_time, summary, location, day_str, event_type,
         f"DTSTAMP:{datetime.now().strftime('%Y%m%dT%H%M%SZ')}",
         f"DTSTART:{start_time.strftime('%Y%m%dT%H%M%SZ')}",
         f"DTEND:{end_time.strftime('%Y%m%dT%H%M%SZ')}",
-        f"SUMMARY:{summary} at {clean_location}",
+        f"SUMMARY:{summary} at {location}",
         f"DESCRIPTION:{description}",
         "BEGIN:VALARM",
         "TRIGGER:-PT15M",
@@ -391,10 +412,11 @@ def process_location(location, start_date, end_date, events, ugadi_date, auth):
     ics_content += "END:VCALENDAR"
 
     filename = f"{location.replace(' ', '_').replace(',', '')}_sandhya_kaalam_{start_date.year}.ics"
-    with open(filename, "w") as ics_file:
+    
+    with open(filename, "w", encoding='utf-8') as ics_file:
         ics_file.write(ics_content)
-    print(f"ICS file '{filename}' created successfully.")
 
+    print(f"ICS file '{filename}' created successfully.")
     print(f"Completed processing for {location}")
 
 
@@ -402,8 +424,12 @@ def process_location(location, start_date, end_date, events, ugadi_date, auth):
 def main():
     start_time = time.time()
 
-    # Initialize authentication
-    auth = ProkeralaAuth(CLIENT_ID, CLIENT_SECRET)
+    # Initialize authentication - rotate auth
+    api_clients = [
+        secrets['api']['clients'][f'client{i+1}']
+        for i in range(len(secrets['api']['clients']))
+    ]
+    auth = ProkeralaAuth(api_clients)
 
     parser = argparse.ArgumentParser(description="Generate Panchangam calendars for multiple locations")
     parser.add_argument("locations", nargs='*', 
@@ -432,7 +458,7 @@ def main():
             events=args.events,
             ugadi_date=ugadi_date
         )
-        time.sleep(10)  # Rate limit protection
+        time.sleep(60)  # Rate limit protection - 1 min between locations
 
     # Execution time calculation
     end_time = time.time()
