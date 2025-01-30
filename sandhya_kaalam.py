@@ -1,4 +1,14 @@
-# python *.py "Mason, OH" --start-date 2025-01-01 --end-date 2025-12-31 --events sunrise noon sunset
+# Author: Goutham Mylavarapu
+# Updated: 28 January 2025
+# Version: 2.0 (With Persistent Caching)
+
+# Summary:
+# Generates .ics file for a given location and date range. Takes about 2 minutes
+
+
+# [USAGE]:
+# python sandhya_kaalam.py "Mason, OH" --start-date 2025-01-01 --end-date 2025-12-31 --events sunrise sunset
+
 
 from datetime import datetime, timedelta
 from geopy.geocoders import Nominatim
