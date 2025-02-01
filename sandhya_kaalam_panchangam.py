@@ -1,6 +1,6 @@
 # Author: Goutham Mylavarapu
-# Updated: 29 January 2025
-# Version: 4.0 (multi-key api support)
+# Updated: 31 January 2025
+# Version: 4.1 (multi-key api support, api error fixes)
 
 # [SUMMARY]:
 # Generates .ics file for a given location and date range
@@ -40,17 +40,17 @@
 #     --debug  # Add this flag to see raw responses
 
 
-import os
-import pickle
 from datetime import datetime, timedelta
 from geopy.geocoders import Nominatim
+
+import os
+import pickle
 import requests
 import pytz
 import argparse
 import time
-from prokerala_api import ApiClient
 import toml
-import json
+
 
 # Configuration
 CACHE_DIR = "./panchangam_cache"
@@ -83,7 +83,12 @@ VAARA_MAP = {
     'Saturday': 'మంద వారము'
 }
 
-Vedic_month_map = {
+TITHI_PAKSHA_MAP = {
+    'Shukla Paksha': 'శుక్ల పక్ష',
+    'Krishna Paksha': 'కృష్ణ పక్ష'
+}
+
+VEDIC_MONTH_MAP = {
     1: 'మాఘ', 2: 'ఫాల్గుణ', 3: 'చైత్ర', 4: 'వైశాఖ',
     5: 'జ్యేష్ఠ', 6: 'ఆషాఢ', 7: 'శ్రావణ', 8: 'భాద్రపద',
     9: 'ఆశ్వయుజ', 10: 'కార్తీక', 11: 'మార్గశిర', 12: 'పుష్య'
@@ -210,9 +215,9 @@ def get_vedic_details(date, ugadi_date):
     vaara = VAARA_MAP.get(date.strftime('%A'), date.strftime('%A'))
     
     return {
-        'masa': Vedic_month_map.get(date.month, ''),
-        'ayana': ayana,
         'samvatsara': samvatsara,
+        'ayana': ayana,
+        'masa': VEDIC_MONTH_MAP.get(date.month, ''),
         'vaara': vaara
     }
 
@@ -243,39 +248,51 @@ def get_panchangam_details(lat, lon, event_time, tz, location, auth):
             access_token = auth.get_access_token()
             headers = {'Authorization': f'Bearer {access_token}'}
             
+            # Remove manual encoding
             response = requests.get(
                 f"{PROKERALA_API_BASE}/astrology/panchang",
                 params={
                     'ayanamsa': 1,
                     'coordinates': f"{lat},{lon}",
-                    'datetime': event_time.isoformat(),
-                    # 'timezone': tz,
+                    'datetime': event_time.isoformat(),  # Direct ISO string
+                    'timezone': tz,
                     'la': 'te'
                 },
                 headers=headers,
                 timeout=10
             )
-
             response.raise_for_status()
             result = response.json()
 
-            # Accept both 'success' and 'ok' statuses
+            # Check API status
             if result.get('status', '').lower() not in ['success', 'ok']:
                 raise ValueError(f"API status failure: {result.get('status')}")
 
-            # Validate response structure
-            panchang = result.get('data', {}).get('panchang', {})
-            if not panchang:
-                raise ValueError("Missing panchang data")
+            # Handle API response structure
+            panchang = result.get('data', {})
+            
+            # Extract tithi (first element of list)
+            tithi = panchang.get('tithi', [{}])
+            paksha_en = tithi[0].get('paksha', '')
+            paksha_te = TITHI_PAKSHA_MAP.get(paksha_en, paksha_en)
+            tithi_str = f"{tithi[0].get(paksha_te, '')} {tithi[0].get('name', 'N/A')}".strip() if tithi else 'N/A'
 
-            # Extract fields with fallbacks
+            # Extract nakshatra (first element of list)
+            nakshatra = panchang.get('nakshatra', [{}])
+            nakshatra_str = nakshatra[0].get('name', 'N/A') if nakshatra else 'N/A'
+
+            # Vaara is direct string value
+            # Get Telugu vaara name
+            # vaara_en = panchang.get('vaara', 'N/A')
+            # vaara_te = VAARA_MAP.get(vaara_en, vaara_en)
+
+            # vaara = panchang.get('vaara', [{}])
+            # vaara_te = vaara[0].get('name', 'N/A') if vaara else 'N/A'
+
             data = {
-                'tithi': f"{panchang.get('tithi', {}).get('paksha', '')} {panchang.get('tithi', {}).get('name', 'N/A')}".strip(),
-                'nakshatra': panchang.get('nakshatra', [{}])[0].get('name', 'N/A'),
-                'vaara': VAARA_MAP.get(
-                    panchang.get('vaara', {}).get('name', ''),
-                    panchang.get('vaara', {}).get('name', 'N/A')
-                )
+                'tithi': tithi_str,
+                'nakshatra': nakshatra_str,
+                # 'vaara': vaara_te
             }
 
             cache[cache_key] = data
@@ -303,7 +320,7 @@ def generate_event(start_time, end_time, summary, location, day_str, event_type,
     # Handle missing panchangam data
     tithi = panchangam.get('tithi', 'సమాచారం అందుబాటులో లేదు') if panchangam else 'సమాచారం అందుబాటులో లేదు'
     nakshatra = panchangam.get('nakshatra', 'N/A') if panchangam else 'N/A'
-    vaara = panchangam.get('vaara', 'N/A') if panchangam else 'N/A'
+    # vaara = panchangam.get('vaara', 'N/A') if panchangam else 'N/A'
     
     description = (
         f"{summary} at {location} on {day_str}\n"
@@ -311,7 +328,7 @@ def generate_event(start_time, end_time, summary, location, day_str, event_type,
         f"అయనము: {vedic_details['ayana']}\n"
         f"మాసము: {vedic_details['masa']}\n"
         f"తిథి: {tithi}\n"
-        f"వారము: {vaara}\n"
+        f"వారము: {vedic_details['vaara']}\n"  # {vaara}\n"
         f"నక్షత్రము: {nakshatra}\n"
     )
     
@@ -367,7 +384,7 @@ def process_location(location, start_date, end_date, events, ugadi_date, auth):
         if ss_data:
             # Sunrise event
             if 'sunrise' in events:
-                sunrise_time = datetime.fromisoformat(ss_data["sunrise"])
+                sunrise_time = datetime.fromisoformat(ss_data["sunrise"].replace('Z', '+00:00'))
                 sunrise_panchang = get_panchangam_details(lat, lon, sunrise_time, tz_str, location, auth=auth)
                 sunrise_start = sunrise_time - timedelta(hours=1, minutes=12)
                 sunrise_end = sunrise_time + timedelta(minutes=48)
@@ -379,7 +396,7 @@ def process_location(location, start_date, end_date, events, ugadi_date, auth):
 
             # Sunset event
             if 'sunset' in events:
-                sunset_time = datetime.fromisoformat(ss_data["sunset"])
+                sunset_time = datetime.fromisoformat(ss_data["sunset"].replace('Z', '+00:00'))
                 sunset_panchang = get_panchangam_details(lat, lon, sunset_time, tz_str, location, auth=auth)
                 sunset_start = sunset_time - timedelta(minutes=24)
                 sunset_end = sunset_time + timedelta(hours=1, minutes=12)
@@ -411,7 +428,7 @@ def process_location(location, start_date, end_date, events, ugadi_date, auth):
 
     ics_content += "END:VCALENDAR"
 
-    filename = f"{location.replace(' ', '_').replace(',', '')}_sandhya_kaalam_{start_date.year}.ics"
+    filename = f"{location.replace(' ', '_').replace(',', '')}_sandhya_kaalam_panchangam_{start_date.year}.ics"
     
     with open(filename, "w", encoding='utf-8') as ics_file:
         ics_file.write(ics_content)
@@ -458,7 +475,8 @@ def main():
             events=args.events,
             ugadi_date=ugadi_date
         )
-        time.sleep(60)  # Rate limit protection - 1 min between locations
+        if len(args.locations) > 1:
+            time.sleep(60)  # Rate limit protection - 1 min between locations
 
     # Execution time calculation
     end_time = time.time()

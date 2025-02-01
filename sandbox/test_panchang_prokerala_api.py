@@ -31,7 +31,7 @@ def panchangam(location):
 
     result = client.get('v2/astrology/panchang', {  # /advanced
         'ayanamsa': 1,
-        'coordinates': '23.1765,75.7885',
+        'coordinates': '39.3600,-84.3099',
         'datetime': '2025-01-29T12:31:14+00:00',
         'la': 'te'  # Telugu, if none specified, it will be English
     })
